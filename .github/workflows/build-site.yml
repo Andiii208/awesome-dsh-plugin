@@ -42,10 +42,10 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # added-date derivation walks the README's history
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: npm ci
@@ -61,7 +61,7 @@ jobs:
       # (#1673). data/stars.json is committed now so a miss costs staleness
       # rather than the data itself; before changing this list again, expect a
       # full re-probe and check the quota first.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             data/npm-map.json
@@ -106,8 +106,8 @@ jobs:
           # set is small enough that there is no reason to sample it (#1619).
           node scripts/probe-tarballs.mjs
           node scripts/build-site.mjs
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
