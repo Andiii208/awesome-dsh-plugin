@@ -2,7 +2,8 @@ name: Build site from README
 
 on:
   schedule:
-    - cron: '23 2 * * *'
+    - cron: '23 2 * * *' # nightly: incremental refresh + deploy
+    - cron: '23 2 * * 0' # Sunday: full re-probe of every entry + deploy
   workflow_dispatch:
     inputs:
       probe_all:
@@ -15,11 +16,12 @@ on:
     # in-flight build (concurrency cancel) or start the one that replaces it.
     # Irrelevant pushes just redeploy the same bytes.
     #
-    # Push builds deploy but do NOT probe (see PROBE below). On a busy day this
-    # workflow runs dozens of times, and each run used to fire another 134
-    # single-package requests at api.npmjs.org — which is what put the download
-    # probe permanently over the rate limit. Fresh data is a once-a-day need;
-    # publishing a newly merged plugin is a right-away need. They are separated.
+    # Push builds deploy but do NOT probe (see PROBE_ALL below). On a busy day
+    # this workflow runs dozens of times, and each run used to fire another
+    # 134 single-package requests at api.npmjs.org — which is what put the
+    # download probe permanently over the rate limit. Fresh data is a
+    # once-a-day need; publishing a newly merged plugin is a right-away need.
+    # They are separated.
 
 # The build never writes to the repository. Added dates derive from git
 # history, probe results live in the Actions cache, docs/ ships as a Pages
@@ -36,15 +38,17 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # Probing spends the GitHub API quota; deploying is the run's one write
+  # against the Pages API. They used to be a single job, so a quota the probes
+  # spent by 08:00 killed the 08:03 deployment — seven nights in a row from
+  # 2026-09-22, each run failing at the same step with "API rate limit
+  # exceeded for installation". Split apart, a probe failure now costs
+  # staleness (yesterday's cached values are deployed) and never costs the
+  # deploy itself.
+  probe:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0 # added-date derivation walks the README's history
       - uses: actions/setup-node@v7
         with:
           node-version: 22
@@ -52,15 +56,17 @@ jobs:
       # Rolling probe cache: unique key so every run saves, restore-keys pulls
       # the most recent.
       #
-      # A miss is NOT harmless, which is what "degraded never, slower once" used
-      # to claim here. actions/cache scopes restores by a version derived from
-      # this `path` list, so editing the list — adding data/tarballs.json on
-      # 2026-08-18 — makes `restore-keys` match nothing and forces a cold start
-      # for every probe at once. That cold start wants ~1,400 API calls, and if
-      # the hourly budget happens to be spent the probes all fail together
-      # (#1673). data/stars.json is committed now so a miss costs staleness
-      # rather than the data itself; before changing this list again, expect a
-      # full re-probe and check the quota first.
+      # v2 -> v3 is deliberate: data/downloads.json joins the list so the
+      # deploy job (a separate checkout) builds from what TODAY's probe
+      # learned, not what a previous run left on disk — the single-job layout
+      # got that for free and the split would have silently dropped it. A
+      # version bump also forces a clean generation rather than appending a
+      # different path set onto the old scope, which used to restore nothing
+      # and cold-start every probe at once (#1673).
+      #
+      # On a miss: data/stars.json and data/downloads.json are committed, so
+      # staleness is the cost, not the data. The ignored ones (npm-map,
+      # readmes, tarballs) cold-start fully — expect a full probe and pace it.
       - uses: actions/cache@v6
         with:
           path: |
@@ -68,18 +74,27 @@ jobs:
             data/stars.json
             data/readmes.json
             data/tarballs.json
-          key: probe-data-v2-${{ github.run_id }}
-          restore-keys: probe-data-v2-
-      - name: Build
+            data/downloads.json
+          key: probe-data-v3-${{ github.run_id }}
+          restore-keys: probe-data-v3-
+      - name: Probe
+        # A failed sweep must not fail the job: everything it managed to learn
+        # is on disk and about to be cached, and the deploy job rebuilds from
+        # committed + cached data. The exit status is visible in the log and
+        # the job summary — loud, not fatal.
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # The nightly run is the authoritative refresh: it re-checks every
-          # entry regardless of cached verdicts, so a plugin that publishes to
-          # npm can never be stuck on a stale "not published" (see #487).
-          # Push-triggered runs stay incremental.
-          PROBE_ALL: ${{ (github.event_name == 'schedule' || inputs.probe_all) && '1' || '' }}
+          # PROBE_ALL is the once-a-week full sweep only: the Sunday cron, or
+          # manual dispatch with the flag. Every entry re-probed regardless of
+          # cached verdicts, so a plugin that publishes to npm can never be
+          # stuck on a stale "not published" (see #487). The nightly run used
+          # to do this too — ~5,000 requests in one hour against a shared
+          # budget near 1,000 — and it is what emptied the quota the deploy
+          # needs (2026-09-22).
+          PROBE_ALL: ${{ (github.event.schedule == '23 2 * * 0' || inputs.probe_all) && '1' || '' }}
         run: |
-          # Probing is for the nightly run and manual dispatch only. A push
+          # Probing is for the nightly/dispatch run and the cold push — a push
           # build deploys what is already committed or cached; it does not go
           # ask the world again. See the `push:` comment above for why.
           # ...unless the cache missed, in which case there is nothing to
@@ -92,20 +107,74 @@ jobs:
             # After probe-npm.mjs, never before: this reads data/npm-map.json
             # to know which entries HAVE a package to probe. Reads and writes
             # data/downloads.json, which is committed (see its own header) —
-            # deliberately absent from the cache `path:` list above, so it
-            # needs no entry there and touching it can never trigger the
-            # cold-start hazard that list's own comment warns about.
+            # cached since the split so the deploy job sees today's numbers.
             node scripts/probe-downloads.mjs
             node scripts/probe-stars.mjs
             node scripts/probe-readmes.mjs
           else
             echo "push build with cached probe data — skipping probes"
           fi
-          # Runs every time, not just nightly: a release-asset URL validated at
-          # submission can 404 later without anyone touching the entry, and the
-          # set is small enough that there is no reason to sample it (#1619).
+          # Runs every time, not just the weekly sweep: a release-asset URL
+          # validated at submission can 404 later without anyone touching the
+          # entry, and the set is small enough that there is no reason to
+          # sample it (#1619). github.com/objects.githubusercontent.com, not
+          # api.github.com — it costs no API quota.
           node scripts/probe-tarballs.mjs
-          node scripts/build-site.mjs
+
+  deploy:
+    needs: probe
+    # Runs even after a failed sweep (!cancelled() is true unless the whole
+    # workflow was cancelled): the last good cached data beats a dead site.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # added-date derivation walks the README's history
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - run: npm ci
+      # The exact key first (this run's sweep) so the just-cached data is
+      # used when it exists; the rolling restore-keys then fall back to
+      # whatever the most recent earlier run saved.
+      - uses: actions/cache/restore@v6
+        with:
+          path: |
+            data/npm-map.json
+            data/stars.json
+            data/readmes.json
+            data/tarballs.json
+            data/downloads.json
+          key: probe-data-v3-${{ github.run_id }}
+          restore-keys: probe-data-v3-
+      - name: Build
+        run: node scripts/build-site.mjs
+      # deploy-pages issues one POST to the Pages API on the same installation
+      # token the probes spend all hour. Checking what is left of the core
+      # quota first turns the failure this workflow lived with for a week —
+      # 403 "API rate limit exceeded for installation" at the last step —
+      # into a documented wait. rate_limit itself is free.
+      - name: Wait for GitHub API quota
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          remaining=$(gh api rate_limit --jq .resources.core.remaining)
+          reset=$(gh api rate_limit --jq .resources.core.reset)
+          echo "core quota remaining: ${remaining}"
+          if [ "${remaining}" -gt 0 ]; then
+            exit 0
+          fi
+          wait=$(( reset - $(date +%s) + 60 ))
+          if [ "${wait}" -gt 1800 ]; then
+            echo "::error::core quota exhausted for another $((wait / 60))m — the sweep needs to be gentler than this"
+            exit 1
+          fi
+          echo "core quota exhausted — sleeping ${wait}s until the window resets"
+          sleep "${wait}"
       - uses: actions/upload-pages-artifact@v5
         with:
           path: docs
