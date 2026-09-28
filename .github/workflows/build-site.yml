@@ -162,19 +162,29 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          remaining=$(gh api rate_limit --jq .resources.core.remaining)
-          reset=$(gh api rate_limit --jq .resources.core.reset)
-          echo "core quota remaining: ${remaining}"
-          if [ "${remaining}" -gt 0 ]; then
-            exit 0
-          fi
-          wait=$(( reset - $(date +%s) + 60 ))
-          if [ "${wait}" -gt 1800 ]; then
-            echo "::error::core quota exhausted for another $((wait / 60))m — the sweep needs to be gentler than this"
-            exit 1
-          fi
-          echo "core quota exhausted — sleeping ${wait}s until the window resets"
-          sleep "${wait}"
+          # The core quota resets hourly, so a window is never more than an hour
+          # away — but after a cold-start sweep it is routinely 30-55 minutes
+          # out, and failing the deploy over that is exactly the behavior this
+          # step exists to avoid. Poll instead: pass the moment quota returns,
+          # give up only past a 90-minute ceiling (which a yearly hourly window
+          # cannot reach — so hitting it means a real block, not a busy hour).
+          deadline=$(( $(date +%s) + 5400 ))
+          while :; do
+            remaining=$(gh api rate_limit --jq .resources.core.remaining)
+            if [ "${remaining}" -gt 0 ]; then
+              echo "core quota remaining: ${remaining} — proceeding"
+              exit 0
+            fi
+            reset=$(gh api rate_limit --jq .resources.core.reset)
+            wait=$(( reset - $(date +%s) + 60 ))
+            if [ "${wait}" -le 0 ]; then wait=30; fi
+            if [ $(( $(date +%s) + wait )) -gt "${deadline}" ]; then
+              echo "::error::core quota exhausted past the 90-minute ceiling — wait for the window and re-run, or check with GitHub Support"
+              exit 1
+            fi
+            echo "core quota exhausted — sleeping ${wait}s until the window resets"
+            sleep "${wait}"
+          done
       - uses: actions/upload-pages-artifact@v5
         with:
           path: docs
