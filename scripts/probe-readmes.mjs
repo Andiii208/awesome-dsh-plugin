@@ -15,12 +15,16 @@
  */
 import fs from 'node:fs'
 import LOCALES from '../site/locales.mjs'
+import { ghGet, GhError, quotaState } from './lib/gh-client.mjs'
 
 const OUT_FILE = 'data/readmes.json'
-// Four GitHub calls per repository across 1,247 of them is enough to trip the
-// secondary rate limit at any concurrency worth having, so the full sweep is
-// the nightly PROBE_ALL run and a push-triggered run refreshes only what is
-// new or stale. Same shape as probe-npm.mjs.
+// Up to five GitHub calls per repository across 1,567 of them is enough to
+// trip the secondary rate limit at any concurrency worth having — this pass
+// used to issue ~60 requests a second and its own comment admitted it.
+// scripts/lib/gh-client.mjs now paces every request through one shared token
+// bucket and sleeps out 403/429, so the sweep spans minutes instead of
+// seconds. The full sweep is the Sunday PROBE_ALL run; nightly and push runs
+// refresh only what is new or stale. Same shape as probe-npm.mjs.
 const RECHECK_DAYS = Number(process.env.PROBE_RECHECK_DAYS ?? 7)
 const PROBE_ALL = process.env.PROBE_ALL === '1'
 const CONCURRENCY = Number(process.env.PROBE_CONCURRENCY ?? (PROBE_ALL ? 4 : 8))
@@ -36,43 +40,6 @@ const map = fs.existsSync(OUT_FILE) ? JSON.parse(fs.readFileSync(OUT_FILE, 'utf8
 const readme = fs.readFileSync(LOCALES[0].readme, 'utf8')
 const urls = [...readme.matchAll(/^- \[.+?\]\((https:\/\/github\.com\/[^)]+)\) [—-] /gm)].map((m) => m[1])
 const today = new Date().toISOString().slice(0, 10)
-
-/** Thrown for a status the caller may want to tell apart (404 vs rate limit). */
-class HttpError extends Error {
-  constructor(status) {
-    super(`HTTP ${status}`)
-    this.status = status
-  }
-}
-
-async function gh(path) {
-  const res = await fetch(`https://api.github.com${path}`, {
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${token}`,
-      'user-agent': 'awesome-dsh-plugin-readme-probe',
-    },
-    signal: AbortSignal.timeout(15000),
-  })
-  if (res.status === 403 || res.status === 429) {
-    // Secondary limits answer with retry-after; primary exhaustion sets
-    // x-ratelimit-remaining: 0 and a reset timestamp. Sleeping is the whole
-    // remedy — retrying immediately is what earns a longer block.
-    const after = Number(res.headers.get('retry-after'))
-    const reset = Number(res.headers.get('x-ratelimit-reset'))
-    const waitMs = Number.isFinite(after) && after > 0
-      ? after * 1000
-      : (res.headers.get('x-ratelimit-remaining') === '0' && Number.isFinite(reset)
-        ? Math.max(0, reset * 1000 - Date.now()) + 1000
-        : 0)
-    if (waitMs > 0 && waitMs <= 120000) {
-      await new Promise((r) => setTimeout(r, waitMs))
-      return gh(path)
-    }
-  }
-  if (!res.ok) throw new HttpError(res.status)
-  return res.json()
-}
 
 // crude language sniff: CJK-heavy → zh
 const langOf = (md) => {
@@ -104,9 +71,9 @@ async function probe(url) {
     let data
     if (sub) {
       // a subdir README when the package ships one, else the repo root README
-      try { data = await gh(`/repos/${repo}/readme/${sub}`) } catch { data = await gh(`/repos/${repo}/readme`) }
+      try { data = await ghGet(`/repos/${repo}/readme/${sub}`) } catch { data = await ghGet(`/repos/${repo}/readme`) }
     } else {
-      data = await gh(`/repos/${repo}/readme`)
+      data = await ghGet(`/repos/${repo}/readme`)
     }
     const main = pack(data, repo)
     const mainLang = langOf(main.md)
@@ -121,7 +88,7 @@ async function probe(url) {
     const listings = {}
     const listDir = async (d) => {
       if (!(d in listings)) {
-        try { listings[d] = new Map((await gh(`/repos/${repo}/contents/${d}`)).map((e) => [e.path.toLowerCase(), e.path])) } catch { listings[d] = new Map() }
+        try { listings[d] = new Map((await ghGet(`/repos/${repo}/contents/${d}`)).map((e) => [e.path.toLowerCase(), e.path])) } catch { listings[d] = new Map() }
       }
       return listings[d]
     }
@@ -132,7 +99,7 @@ async function probe(url) {
       const path = (await listDir(parent)).get(want.toLowerCase())
       if (!path) continue
       try {
-        const alt = await gh(`/repos/${repo}/contents/${path}`)
+        const alt = await ghGet(`/repos/${repo}/contents/${path}`)
         if (alt.content) {
           const packed = pack(alt, repo)
           // trust the sniff over the filename — some "zh" files are English stubs
@@ -144,8 +111,9 @@ async function probe(url) {
   } catch (e) {
     // A 404 means the repository genuinely ships no README. Anything else — a
     // secondary rate limit above all — means we never got to look, which is a
-    // different fact and must not be recorded as "no README".
-    if (e instanceof HttpError && e.status === 404) return { missing: true }
+    // different fact and must not be recorded as "no README". The marker is
+    // cached on purpose: without it every run re-fetches this repo forever.
+    if (e instanceof GhError && e.status === 404) return { missing: true, fetchedAt: today }
     return null
   }
 }
@@ -167,8 +135,10 @@ for (let i = 0; i < pending.length; i += CONCURRENCY) {
   const results = await Promise.all(batch.map(async (url) => [url, await probe(url)]))
   for (const [url, result] of results) {
     if (result === null) failed.push(url)
-    else if (result.missing) noReadme++
-    else map[url] = result
+    else {
+      if (result.missing) noReadme++
+      map[url] = result
+    }
   }
   done += batch.length
   if (done % 50 === 0 || done >= pending.length) console.log(`readmes ${done}/${pending.length}`)
@@ -178,18 +148,25 @@ for (let i = 0; i < pending.length; i += CONCURRENCY) {
 // An entry added since the previous run has nothing to fall back on, and its
 // page renders with no README at all — which is what happened to every plugin
 // merged today. It stayed invisible because a failure and a hit looked the
-// same from the outside: this pass issues roughly sixty requests a second,
-// trips GitHub's secondary limit, and still printed a healthy count.
+// same from the outside: this pass used to issue roughly sixty requests a
+// second, trips GitHub's secondary limit, and still printed a healthy count.
+// Requests now go out paced through scripts/lib/gh-client.mjs, but a 403 that
+// outlives the wait budget still lands here — so this retry stays.
 if (failed.length) {
-  console.log(`${failed.length} repo(s) failed the first pass — retrying serially`)
-  await new Promise((r) => setTimeout(r, 20000))
+  const quota = quotaState()
+  const resetIn = quota.resetInMs ? `, quota window resets in ${Math.round(quota.resetInMs / 1000)}s` : ''
+  console.log(`${failed.length} repo(s) failed the first pass — retrying serially (quota remaining: ${quota.remaining ?? 'unknown'}${resetIn})`)
+  // A short cooldown only. The old 20-second stall bought nothing that the
+  // client's own retry-after handling does not already cover.
+  await new Promise((r) => setTimeout(r, 5000))
   const stillFailed = []
   for (const url of failed) {
     const result = await probe(url)
     if (result === null) stillFailed.push(url)
-    else if (result.missing) noReadme++
-    else map[url] = result
-    await new Promise((r) => setTimeout(r, 250))
+    else {
+      if (result.missing) noReadme++
+      map[url] = result
+    }
   }
   failed.length = 0
   failed.push(...stillFailed)
@@ -209,6 +186,11 @@ console.log(`readmes.json written: ${Object.keys(sorted).length} repos (${noRead
 if (failed.length) {
   const fresh = failed.filter((u) => !(u in map))
   console.log(`${failed.length} repo(s) could not be fetched; ${fresh.length} have no previous data and will render without a README:`)
-  for (const u of failed.slice(0, 20)) console.log(`  ${u}${u in map ? ' (kept previous)' : ' (NEW — page will show no README)'}`)
+  for (const u of failed.slice(0, 20)) {
+    const note = u in map
+      ? (map[u].missing ? ' (ships no README)' : ' (kept previous)')
+      : ' (NEW — page will show no README)'
+    console.log(`  ${u}${note}`)
+  }
   if (failed.length > 20) console.log(`  … and ${failed.length - 20} more`)
 }

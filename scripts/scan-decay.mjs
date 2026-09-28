@@ -14,6 +14,7 @@
 //   GITHUB_TOKEN=... node scripts/scan-decay.mjs            # scan + issue
 //   GITHUB_TOKEN=... node scripts/scan-decay.mjs --dry-run  # scan, print only
 import { readEntries } from './lib/entries.mjs'
+import { ghRaw } from './lib/gh-client.mjs'
 
 const DORMANT_MONTHS = 6
 const CONCURRENCY = 8
@@ -27,13 +28,15 @@ if (!TOKEN) {
   console.log('no GITHUB_TOKEN — skipping decay scan')
   process.exit(0)
 }
-const HEADERS = { accept: 'application/vnd.github+json', authorization: `Bearer ${TOKEN}`, 'user-agent': 'awesome-dsh-plugin-decay-scan' }
 
+// Same client as the probes (scripts/lib/gh-client.mjs). One weekly sweep of
+// 1,567 entries fires ~4,000 requests, and at the old unthrotted rate that
+// 128-second burst could push the shared installation quota into the ground —
+// it did, on the night before 2026-09-22, when every deploy since has been
+// refused with "API rate limit exceeded for installation". 403 now sleeps out
+// instead of being counted as an inconclusive scan.
 async function api(pathname, opts = {}) {
-  const r = await fetch(`https://api.github.com/${pathname}`, { headers: HEADERS, signal: AbortSignal.timeout(20000), ...opts })
-  if (r.status === 404) return { status: 404 }
-  if (!r.ok) return { status: r.status }
-  return { status: 200, body: await r.json().catch(() => null) }
+  return ghRaw(pathname, opts)
 }
 
 function decompose(url) {

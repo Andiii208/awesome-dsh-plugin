@@ -27,15 +27,17 @@
  */
 import fs from 'node:fs'
 import LOCALES from '../site/locales.mjs'
+import { ghGet } from './lib/gh-client.mjs'
 
 const STARS_FILE = 'data/stars.json'
-const CONCURRENCY = 10
+const CONCURRENCY = 10 // the shared client paces requests anyway; this only bounds memory
 // A GitHub Actions token is capped at ~1000 requests per hour per repository,
-// shared by every workflow. Probing all ~1300 entries on each push blew that
-// budget on its own — with a dozen merges in an hour the Submission gate was
-// left with nothing and died mid-run, which is how submissions came to sit
-// with no verdict at all. Push-triggered runs now refresh only what is new or
-// a day stale; the nightly PROBE_ALL run still sweeps everything.
+// shared by every workflow. Push builds once probed all ~1300 entries and blew
+// that budget on their own — with a dozen merges in an hour the Submission gate
+// was left with nothing and died mid-run, which is how submissions came to sit
+// with no verdict at all. Push-triggered runs now refresh only what is new or a
+// day stale, the nightly run is incremental, and only the Sunday sweep sets
+// PROBE_ALL; scripts/lib/gh-client.mjs paces whatever still goes out.
 const RECHECK_DAYS = Number(process.env.PROBE_RECHECK_DAYS ?? 1)
 const PROBE_ALL = process.env.PROBE_ALL === '1'
 // Entries added since the last probe legitimately have no count yet, and a
@@ -67,16 +69,10 @@ async function probe(url) {
   // monorepo subdir entries (…/tree/main/path) inherit the parent repo's stars
   const repoPath = url.replace('https://github.com/', '').replace(/\/$/, '').split('/').slice(0, 2).join('/')
   try {
-    const res = await fetch(`https://api.github.com/repos/${repoPath}`, {
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${token}`,
-        'user-agent': 'awesome-dsh-plugin-stars-probe',
-      },
-      signal: AbortSignal.timeout(10000),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const repo = await res.json()
+    // Waiting is the client's job (scripts/lib/gh-client.mjs), not this
+    // function's: it used to be nobody's job, and a spent quota came out
+    // indistinguishable from a repository that no longer exists.
+    const repo = await ghGet(`/repos/${repoPath}`)
     if (typeof repo.stargazers_count !== 'number') throw new Error('no stargazers_count')
     return { stars: repo.stargazers_count, checkedAt: today }
   } catch {
